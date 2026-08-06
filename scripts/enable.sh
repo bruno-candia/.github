@@ -32,6 +32,13 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+# A called workflow cannot ask for more than the caller holds, and the default
+# for a repository is read only. Without this the run dies before it starts,
+# saying it wanted `pull-requests: write` and was allowed `none`.
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   jules:
     uses: bruno-candia/.github/.github/workflows/jules-review.yml@main
