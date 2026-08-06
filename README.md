@@ -18,7 +18,18 @@ own.
    shows up under Codebases. The workflow fails with a clear message otherwise.
 2. Add a `JULES_API_KEY` secret to the repository, from Jules Settings, API Key.
 3. Copy `examples/pr-review.yml` to `.github/workflows/pr-review.yml`, or let
-   `scripts/enable.sh` do steps 2 and 3 for a list of repositories.
+   `scripts/enable.sh` do steps 2 and 3 for a list of repositories:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/bruno-candia/.github/main/scripts/enable.sh -o enable.sh
+   chmod +x enable.sh
+   export JULES_API_KEY=...
+   ./enable.sh portfolio galaxy mcp-hub
+   ```
+
+   The script is one self contained file. Cloning this repository is not
+   required, and cloning it by its own name lands a hidden `.github` folder
+   inside whatever directory you happen to be in.
 
 The script pushes over SSH and opens a pull request rather than committing to
 the default branch. Writing under `.github/workflows` through the API needs the
