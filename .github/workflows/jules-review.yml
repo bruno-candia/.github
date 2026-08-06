@@ -124,19 +124,39 @@ jobs:
           LIMIT_MINUTES: ${{ inputs.timeout_minutes }}
         run: |
           set -euo pipefail
+          # A review asks for no commit and no pull request, so the session has
+          # nothing to finish with: it answers and then sits waiting for the
+          # next instruction. Waiting for `sessionCompleted` therefore burns the
+          # whole timeout on every run. Stop when the answer stops changing.
           deadline=$(( $(date +%s) + LIMIT_MINUTES * 60 ))
-          state=running
+          state=waiting
+          quiet=0
+          previous=""
+
           while [ "$(date +%s)" -lt "$deadline" ]; do
             curl -sS -H "x-goog-api-key: $JULES_API_KEY" \
               "https://jules.googleapis.com/v1alpha/sessions/$SESSION/activities?pageSize=100" > activities.json
-            if jq -e '.activities[]? | select(has("sessionCompleted"))' activities.json > /dev/null; then
-              state=completed; break
-            fi
+
             if jq -e '.activities[]? | select(has("sessionFailed"))' activities.json > /dev/null; then
               state=failed; break
             fi
-            sleep 15
+
+            current=$(jq -r '[.activities[]? | select(has("agentMessaged")) | .agentMessaged.agentMessage] | last // ""' activities.json)
+
+            if jq -e '.activities[]? | select(has("sessionCompleted"))' activities.json > /dev/null; then
+              state=completed; break
+            fi
+
+            if [ -n "$current" ] && [ "$current" = "$previous" ]; then
+              quiet=$(( quiet + 1 ))
+              if [ "$quiet" -ge 3 ]; then state=answered; break; fi
+            else
+              quiet=0
+            fi
+            previous="$current"
+            sleep 10
           done
+
           jq -r '[.activities[]? | select(has("agentMessaged")) | .agentMessaged.agentMessage] | last // ""' \
             activities.json > review.md
           echo "state=$state" >> "$GITHUB_OUTPUT"
@@ -154,9 +174,10 @@ jobs:
             printf '%s\n### Jules review\n\n' "$marker"
             if [ -s review.md ]; then cat review.md; else printf 'Jules returned no findings.\n'; fi
             printf '\n\n'
-            if [ "$STATE" != "completed" ]; then
-              printf '_Session ended as `%s`._ ' "$STATE"
-            fi
+            case "$STATE" in
+              completed|answered) ;;
+              *) printf '_Session ended as `%s`._ ' "$STATE" ;;
+            esac
             printf '[Session](%s)\n' "$SESSION_URL"
           } > comment.md
           # Upsert, so a rerun on a new push replaces the previous verdict
