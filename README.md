@@ -17,7 +17,13 @@ own.
 1. Connect the repository at [jules.google.com](https://jules.google.com) so it
    shows up under Codebases. The workflow fails with a clear message otherwise.
 2. Add a `JULES_API_KEY` secret to the repository, from Jules Settings, API Key.
-3. Copy `examples/pr-review.yml` to `.github/workflows/pr-review.yml`.
+3. Copy `examples/pr-review.yml` to `.github/workflows/pr-review.yml`, or let
+   `scripts/enable.sh` do steps 2 and 3 for a list of repositories.
+
+The script pushes over SSH and opens a pull request rather than committing to
+the default branch. Writing under `.github/workflows` through the API needs the
+`workflow` OAuth scope that the `gh` token does not carry, and a protected
+default branch would refuse a direct push anyway.
 
 ### Cost
 
