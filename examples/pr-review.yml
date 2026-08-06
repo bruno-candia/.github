@@ -1,0 +1,14 @@
+# Copy to .github/workflows/pr-review.yml in any repository that should get
+# reviewed. The JULES_API_KEY secret has to exist in that repository.
+
+name: Pull request review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  jules:
+    uses: bruno-candia/.github/.github/workflows/jules-review.yml@main
+    secrets:
+      JULES_API_KEY: ${{ secrets.JULES_API_KEY }}

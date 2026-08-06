@@ -1,0 +1,169 @@
+# Reusable pull request review, driven by the Jules API.
+#
+# Jules is an agent that edits code, so the prompt is explicit that this run
+# reviews and reports only. The session is created against the pull request
+# branch with no automation mode, which is what keeps it from opening its own
+# pull request on top of yours.
+#
+# Called from a repository like this:
+#
+#   jobs:
+#     review:
+#       uses: bruno-candia/.github/.github/workflows/jules-review.yml@main
+#       secrets:
+#         JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
+
+name: Jules review
+
+on:
+  workflow_call:
+    inputs:
+      max_diff_chars:
+        description: Characters of diff sent to Jules before it is truncated.
+        type: number
+        default: 100000
+      timeout_minutes:
+        description: How long to wait for the review before giving up.
+        type: number
+        default: 20
+      house_rules:
+        description: Extra instructions appended to the review prompt.
+        type: string
+        default: ''
+    secrets:
+      JULES_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # A fork gets no secrets, so the run would fail on an empty key rather than
+    # tell you why. Skip it instead.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 30
+
+    steps:
+      - name: Collect the diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          LIMIT: ${{ inputs.max_diff_chars }}
+        run: |
+          set -euo pipefail
+          gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --patch > full.diff
+          size=$(wc -c < full.diff)
+          head -c "$LIMIT" full.diff > sent.diff
+          if [ "$size" -gt "$LIMIT" ]; then
+            printf '\n[diff truncated at %s of %s bytes]\n' "$LIMIT" "$size" >> sent.diff
+          fi
+          echo "bytes=$size" >> "$GITHUB_OUTPUT"
+
+      - name: Find the Jules source for this repository
+        id: source
+        env:
+          JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          curl -sS -H "x-goog-api-key: $JULES_API_KEY" \
+            "https://jules.googleapis.com/v1alpha/sources?pageSize=100" > sources.json
+          name=$(jq -r --arg o "$owner" --arg r "$repo" \
+            '.sources[]? | select(.githubRepo.owner == $o and .githubRepo.repo == $r) | .name' \
+            sources.json | head -1)
+          if [ -z "$name" ]; then
+            echo "::error::$GITHUB_REPOSITORY is not connected to Jules. Add it at jules.google.com and rerun."
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Ask Jules to review
+        id: session
+        env:
+          JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
+          SOURCE: ${{ steps.source.outputs.name }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          RULES: ${{ inputs.house_rules }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'Review this pull request. Report only. Do not edit files, do not commit, and do not open a pull request.\n\n'
+            printf 'Title: %s\n\n' "$TITLE"
+            printf 'Description:\n%s\n\n' "$BODY"
+            printf 'Report findings as a list, worst first. For each one give the file and line, what breaks, and the concrete input or state that breaks it. Say if you are unsure rather than guessing. If you find nothing worth changing, say that in one line.\n\n'
+            printf 'Skip style opinions the linter already covers. Prefer correctness, security, data loss, and behaviour that contradicts the description above.\n\n'
+            if [ -n "$RULES" ]; then printf 'House rules:\n%s\n\n' "$RULES"; fi
+            printf 'Diff:\n\n'
+            cat sent.diff
+          } > prompt.txt
+          jq -n --rawfile prompt prompt.txt --arg source "$SOURCE" --arg branch "$BRANCH" --arg title "Review: $TITLE" \
+            '{prompt: $prompt, title: $title, requirePlanApproval: false,
+              sourceContext: {source: $source, githubRepoContext: {startingBranch: $branch}}}' > body.json
+          curl -sS -X POST -H "x-goog-api-key: $JULES_API_KEY" -H "Content-Type: application/json" \
+            -d @body.json "https://jules.googleapis.com/v1alpha/sessions" > session.json
+          id=$(jq -r '.id // empty' session.json)
+          if [ -z "$id" ]; then
+            echo "::error::Jules refused the session: $(jq -c '.error // .' session.json)"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "url=$(jq -r '.url // empty' session.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the review
+        id: wait
+        env:
+          JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
+          SESSION: ${{ steps.session.outputs.id }}
+          LIMIT_MINUTES: ${{ inputs.timeout_minutes }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + LIMIT_MINUTES * 60 ))
+          state=running
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            curl -sS -H "x-goog-api-key: $JULES_API_KEY" \
+              "https://jules.googleapis.com/v1alpha/sessions/$SESSION/activities?pageSize=100" > activities.json
+            if jq -e '.activities[]? | select(has("sessionCompleted"))' activities.json > /dev/null; then
+              state=completed; break
+            fi
+            if jq -e '.activities[]? | select(has("sessionFailed"))' activities.json > /dev/null; then
+              state=failed; break
+            fi
+            sleep 15
+          done
+          jq -r '[.activities[]? | select(has("agentMessaged")) | .agentMessaged.agentMessage] | last // ""' \
+            activities.json > review.md
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Post the review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          STATE: ${{ steps.wait.outputs.state }}
+          SESSION_URL: ${{ steps.session.outputs.url }}
+        run: |
+          set -euo pipefail
+          marker='<!-- jules-review -->'
+          {
+            printf '%s\n### Jules review\n\n' "$marker"
+            if [ -s review.md ]; then cat review.md; else printf 'Jules returned no findings.\n'; fi
+            printf '\n\n'
+            if [ "$STATE" != "completed" ]; then
+              printf '_Session ended as `%s`._ ' "$STATE"
+            fi
+            printf '[Session](%s)\n' "$SESSION_URL"
+          } > comment.md
+          # Upsert, so a rerun on a new push replaces the previous verdict
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq "[.[] | select(.body | startswith(\"$marker\"))] | last | .id // empty")
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F body=@comment.md > /dev/null
+          else
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file comment.md
+          fi
