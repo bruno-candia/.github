@@ -46,6 +46,14 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
 
+    # Three pushes in a row used to mean three sessions racing for the same
+    # comment, and the slowest writer won: a run that timed out with nothing to
+    # say could land on top of a finished review. Callers are asked to set this
+    # too, but a caller that forgets still gets one review per pull request.
+    concurrency:
+      group: jules-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
     steps:
       - name: Collect the diff
         id: diff
@@ -58,10 +66,18 @@ jobs:
           gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --patch > full.diff
           size=$(wc -c < full.diff)
           head -c "$LIMIT" full.diff > sent.diff
+          truncated=false
           if [ "$size" -gt "$LIMIT" ]; then
             printf '\n[diff truncated at %s of %s bytes]\n' "$LIMIT" "$size" >> sent.diff
+            truncated=true
           fi
-          echo "bytes=$size" >> "$GITHUB_OUTPUT"
+          files=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json files --jq '.files | length')
+          {
+            echo "bytes=$size"
+            echo "files=$files"
+            echo "truncated=$truncated"
+            echo "started=$(date +%s)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Find the Jules source for this repository
         id: source
@@ -97,7 +113,7 @@ jobs:
             printf 'Review this pull request. Report only. Do not edit files, do not commit, and do not open a pull request.\n\n'
             printf 'Title: %s\n\n' "$TITLE"
             printf 'Description:\n%s\n\n' "$BODY"
-            printf 'Report findings as a list, worst first. For each one give the file and line, what breaks, and the concrete input or state that breaks it. Say if you are unsure rather than guessing. If you find nothing worth changing, say that in one line.\n\n'
+            printf 'Report findings as a list, worst first. Prefix each one with a severity of `blocker`, `major`, or `minor`, then give the file and line, what breaks, and the concrete input or state that breaks it. Say if you are unsure rather than guessing. If you find nothing worth changing, reply with exactly `No findings.` and nothing else.\n\n'
             printf 'Skip style opinions the linter already covers. Prefer correctness, security, data loss, and behaviour that contradicts the description above.\n\n'
             if [ -n "$RULES" ]; then printf 'House rules:\n%s\n\n' "$RULES"; fi
             printf 'Diff:\n\n'
@@ -129,7 +145,7 @@ jobs:
           # next instruction. Waiting for `sessionCompleted` therefore burns the
           # whole timeout on every run. Stop when the answer stops changing.
           deadline=$(( $(date +%s) + LIMIT_MINUTES * 60 ))
-          state=waiting
+          state=timeout
           quiet=0
           previous=""
 
@@ -159,30 +175,101 @@ jobs:
 
           jq -r '[.activities[]? | select(has("agentMessaged")) | .agentMessaged.agentMessage] | last // ""' \
             activities.json > review.md
+          jq -r '[.activities[]? | select(has("sessionFailed")) | .sessionFailed.title // .sessionFailed.description] | last // ""' \
+            activities.json > failure.txt
           echo "state=$state" >> "$GITHUB_OUTPUT"
 
       - name: Post the review
+        if: always() && steps.session.outputs.id != ''
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-          STATE: ${{ steps.wait.outputs.state }}
+          STATE: ${{ steps.wait.outputs.state || 'failed' }}
           SESSION_URL: ${{ steps.session.outputs.url }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          FILES: ${{ steps.diff.outputs.files }}
+          BYTES: ${{ steps.diff.outputs.bytes }}
+          TRUNCATED: ${{ steps.diff.outputs.truncated }}
+          STARTED: ${{ steps.diff.outputs.started }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           marker='<!-- jules-review -->'
-          {
-            printf '%s\n### Jules review\n\n' "$marker"
-            if [ -s review.md ]; then cat review.md; else printf 'Jules returned no findings.\n'; fi
-            printf '\n\n'
-            case "$STATE" in
-              completed|answered) ;;
-              *) printf '_Session ended as `%s`._ ' "$STATE" ;;
-            esac
-            printf '[Session](%s)\n' "$SESSION_URL"
-          } > comment.md
-          # Upsert, so a rerun on a new push replaces the previous verdict
+          [ -f review.md ] || : > review.md
+          [ -f failure.txt ] || : > failure.txt
+
+          # `jq -r ... // ""` writes a bare newline, so the file is one byte and
+          # `test -s` calls it content. Strip the whitespace before deciding.
+          review=$(cat review.md)
+          stripped=$(printf '%s' "$review" | tr -d '[:space:]')
+
           existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
             --jq "[.[] | select(.body | startswith(\"$marker\"))] | last | .id // empty")
+
+          # A run with nothing to say must never clobber a run that answered.
+          # Concurrency should stop the race from happening at all; this is the
+          # backstop for a cancelled sibling or a session that stalled. With no
+          # comment to protect, the failure is still worth reporting.
+          if [ -z "$stripped" ] && [ -n "$existing" ] && [ "$STATE" != completed ] && [ "$STATE" != answered ]; then
+            echo "::warning::Jules produced no review and the session ended as '$STATE'. Leaving any existing comment untouched."
+            {
+              printf '### ⏳ Jules review did not finish\n\n'
+              printf 'Session ended as `%s` with no message. The previous review comment, if any, was left in place.\n\n' "$STATE"
+              printf '[Session](%s)\n' "$SESSION_URL"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # GitHub rejects a comment body over 65536 characters.
+          if [ "${#review}" -gt 60000 ]; then
+            review="${review:0:60000}"$'\n\n_Review truncated. Read the rest in the session._'
+          fi
+
+          case "$STATE" in
+            completed|answered)
+              if [ -z "$stripped" ] || printf '%s' "$stripped" | grep -qix 'nofindings.\?'; then
+                icon='✅'; headline='No findings'
+                review='Jules read the diff and found nothing worth changing.'
+              else
+                icon='🔍'; headline='Review complete'
+              fi
+              ;;
+            failed)
+              icon='❌'; headline='Session failed'
+              if [ -z "$stripped" ]; then review='Jules ended the session without reviewing the diff.'; fi
+              reason=$(cat failure.txt)
+              if [ -n "$reason" ]; then review="$review"$'\n\n> '"$reason"; fi
+              ;;
+            *)
+              icon='⏳'; headline='Timed out'
+              if [ -z "$stripped" ]; then
+                review="Jules did not answer within the time limit. Nothing was reviewed."
+              fi
+              ;;
+          esac
+
+          elapsed=$(( $(date +%s) - STARTED ))
+          duration=$(printf '%dm %ds' $(( elapsed / 60 )) $(( elapsed % 60 )))
+          scope="$FILES file(s), $BYTES bytes of diff"
+          if [ "$TRUNCATED" = true ]; then scope="$scope (truncated before sending)"; fi
+
+          {
+            printf '%s\n' "$marker"
+            printf '## %s Jules review — %s\n\n' "$icon" "$headline"
+            printf '<sub><code>%s</code> → <code>%s</code> · <code>%s</code> · %s</sub>\n\n' \
+              "$HEAD_REF" "$BASE_REF" "${SHA:0:7}" "$scope"
+            printf -- '---\n\n'
+            printf '%s\n\n' "$review"
+            printf -- '---\n\n'
+            printf '<sub>🤖 Reviewed by <a href="https://jules.google.com">Jules</a> in %s · <a href="%s">Session</a> · <a href="%s">Workflow run</a></sub>\n' \
+              "$duration" "$SESSION_URL" "$RUN_URL"
+          } > comment.md
+
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+          # Upsert, so a rerun on a new push replaces the previous verdict
           if [ -n "$existing" ]; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F body=@comment.md > /dev/null
           else
